@@ -1,0 +1,260 @@
+# Load required libraries
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(corrplot)
+library(scales)
+
+# Step 1: Load datasets
+housing <- read_csv("data/india_census_housing-hlpca-full.csv")
+districts <- read_csv("data/india-districts-census-2011.csv")
+
+# Step 2: Filter and prepare housing dataset (Total only)
+housing_filtered <- housing %>%
+  filter(`Rural/Urban` == "Total") %>%
+  mutate(
+    Total_Houses = `Total Number of Good` + `Total Number of Livable` + `Total Number of Dilapidated`,
+    Pct_Good = 100 * `Total Number of Good` / Total_Houses,
+    Pct_Livable = 100 * `Total Number of Livable` / Total_Houses,
+    Pct_Dilapidated = 100 * `Total Number of Dilapidated` / Total_Houses,
+    HQI = (1 * Pct_Good + 0.5 * Pct_Livable + 0 * Pct_Dilapidated) / 100
+  ) %>%
+  mutate(`District Code` = str_pad(as.character(`District Code`), 4, pad = "0")) %>%  # FIXED CODE PADDING
+  select(`District Code`, `State Name`, `District Name`, HQI, Pct_Good, Pct_Livable, Pct_Dilapidated)
+
+# Step 3: Prepare district-level dataset
+districts_clean <- districts %>%
+  rename(`District Code` = `District code`) %>%
+  mutate(`District Code` = str_pad(as.character(`District Code`), 4, pad = "0")) %>%
+  select(`District Code`,
+         Literacy = `Literate`,
+         Female_Literacy = `Female_Literate`,
+         SC = `SC`,
+         ST = `ST`,
+         Households = `Households`,
+         Population = `Population`) %>%
+  mutate(across(c(Literacy, Female_Literacy, SC, ST), as.numeric))
+
+# Step 4: Merge datasets with type correction
+merged <- housing_filtered %>%
+  inner_join(districts_clean, by = "District Code") %>%
+  mutate(
+    SC_Percent = 100 * SC / Population,
+    ST_Percent = 100 * ST / Population,
+    Literacy_Rate = 100 * Literacy / Population,
+    Female_Literacy_Rate = 100 * Female_Literacy / Population
+  )
+
+# Add new features
+density_gap <- merged %>%
+  mutate(
+    Population_Density = Population / Households,
+    Literacy_Gender_Gap = Literacy_Rate - Female_Literacy_Rate
+  )
+
+# Histogram of gender literacy gap
+ggplot(density_gap, aes(x = Literacy_Gender_Gap)) +
+  geom_histogram(fill = "tomato", bins = 30, color = "white") +
+  labs(
+    title = "Distribution of Gender Literacy Gap Across Districts",
+    x = "Male - Female Literacy Rate (%)",
+    y = "Number of Districts"
+  ) +
+  theme_minimal()
+
+# Top & Bottom HQI districts
+top_bottom <- merged %>%
+  arrange(desc(HQI)) %>%
+  slice(c(1:10, (n()-9):n())) %>%
+  mutate(Rank = if_else(row_number() <= 10, "Top 10", "Bottom 10"))
+
+ggplot(top_bottom, aes(x = reorder(`District Name`, HQI), y = HQI, fill = HQI)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~Rank, scales = "free_y") +
+  scale_fill_gradient(low = "#d73027", high = "#1a9850") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Top & Bottom 10 Districts by Housing Quality Index (HQI)",
+    subtitle = "Based on Good, Livable, and Dilapidated Housing Conditions",
+    x = "District",
+    y = "Housing Quality Index (0–1 scale)"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Correlation plot
+cor_vars <- merged %>%
+  select(HQI, Literacy_Rate, Female_Literacy_Rate, SC_Percent, ST_Percent, Households, Population)
+
+cor_matrix <- cor(cor_vars, use = "complete.obs")
+
+corrplot(cor_matrix, method = "color", type = "upper",
+         col = colorRampPalette(c("red", "white", "blue"))(200),
+         tl.col = "black", addCoef.col = "black", number.cex = 0.8,
+         title = "Correlation: HQI vs Demographic Indicators", mar=c(0,0,2,0))
+
+# State-wise HQI summary
+state_hqi_summary <- merged %>%
+  group_by(`State Name`) %>%
+  summarise(
+    Districts = n(),
+    Mean_HQI = mean(HQI, na.rm = TRUE),
+    Median_HQI = median(HQI, na.rm = TRUE),
+    Min_HQI = min(HQI, na.rm = TRUE),
+    Max_HQI = max(HQI, na.rm = TRUE)
+  ) %>%
+  arrange(desc(Mean_HQI))
+
+print(state_hqi_summary)
+
+# State-wise Average HQI Bar Plot
+ggplot(state_hqi_summary, aes(x = reorder(`State Name`, Mean_HQI), y = Mean_HQI, fill = Mean_HQI)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_viridis_c(option = "C") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Average Housing Quality Index (HQI) by State",
+    x = "State",
+    y = "Mean HQI"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Spatial mapping: Load shapefile
+library(sf)
+district_shapefile <- st_read("data/2011_Dist.shp") %>%
+  mutate(censuscode = str_pad(as.character(censuscode), width = 4, pad = "0"))
+
+# Join shapefile with HQI data
+hqi_map_data <- district_shapefile %>%
+  left_join(housing_filtered %>% select(`District Code`, HQI), by = c("censuscode" = "District Code"))
+
+# Fuzzy join for fixing missing HQI districts
+library(fuzzyjoin)
+
+missing_hqi <- hqi_map_data %>% filter(is.na(HQI)) %>% 
+  select(DISTRICT, ST_NM, geometry)  # keep geometry
+missing_names <- missing_hqi %>% st_drop_geometry()
+
+fuzzy_matched <- stringdist_left_join(
+  missing_names,
+  housing_filtered %>% select(`District Name`, `State Name`, HQI),
+  by = c("DISTRICT" = "District Name", "ST_NM" = "State Name"),
+  max_dist = 2, method = "jw"
+) %>%
+  group_by(DISTRICT, ST_NM) %>%
+  slice_min(order_by = stringdist::stringdist(DISTRICT, `District Name`, method = "jw"), n = 1) %>%
+  ungroup() %>%
+  select(DISTRICT, ST_NM, HQI)
+
+# Fill missing HQI from fuzzy match
+hqi_map_data <- hqi_map_data %>%
+  left_join(fuzzy_matched, by = c("DISTRICT", "ST_NM")) %>%
+  mutate(HQI = ifelse(is.na(HQI.x), HQI.y, HQI.x)) %>%
+  select(-HQI.x, -HQI.y)
+
+# Static HQI map (final version)
+ggplot(hqi_map_data) +
+  geom_sf(aes(fill = HQI), color = NA) +
+  scale_fill_viridis_c(option = "D", na.value = "grey90", labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "District-wise Housing Quality Index (HQI) in India",
+    fill = "HQI"
+  ) +
+  theme_minimal()
+
+# Final HQI missing count
+cat("✅ Final missing HQI count:", sum(is.na(hqi_map_data$HQI)), "\n")
+
+# Interactive HQI map
+library(leaflet)
+library(RColorBrewer)
+hqi_map_data <- st_transform(hqi_map_data, crs = 4326)
+
+pal <- colorNumeric(palette = "YlGnBu", domain = hqi_map_data$HQI, na.color = "lightgrey")
+
+leaflet(data = hqi_map_data) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal(HQI),
+    weight = 0.5,
+    opacity = 1,
+    color = "white",
+    dashArray = "1",
+    fillOpacity = 0.8,
+    label = ~paste0(DISTRICT, ", ", ST_NM, "<br>HQI: ", ifelse(is.na(HQI), "Missing", round(HQI * 100, 1)), "%"),
+    highlightOptions = highlightOptions(
+      weight = 2,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    )
+  ) %>%
+  addLegend(pal = pal, values = hqi_map_data$HQI, opacity = 0.7,
+            title = "Housing Quality Index", position = "bottomright",
+            labFormat = labelFormat(suffix = "%", transform = function(x) x * 100))
+
+# Clustering
+library(cluster)
+library(factoextra)
+merged <- merged %>%
+  mutate(Population_Density = Population / Households,
+         Literacy_Gender_Gap = Literacy_Rate - Female_Literacy_Rate)
+
+cluster_features <- merged %>%
+  select(District = `District Name`, State = `State Name`, HQI, Literacy_Rate, SC_Percent, ST_Percent, Population_Density) %>%
+  drop_na()
+
+district_info <- cluster_features %>% select(District, State)
+
+scaled_features <- cluster_features %>%
+  select(HQI, Literacy_Rate, SC_Percent, ST_Percent, Population_Density) %>%
+  scale()
+
+set.seed(42)
+kmeans_result <- kmeans(scaled_features, centers = 4)
+
+clustered_data <- district_info %>%
+  mutate(Cluster = as.factor(kmeans_result$cluster))
+
+merged <- merged %>%
+  left_join(clustered_data, by = c("District Name" = "District", "State Name" = "State"))
+
+# Cluster distribution
+ggplot(clustered_data, aes(x = State, fill = Cluster)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Cluster Distribution by State", x = "State", y = "Proportion", fill = "Cluster") +
+  theme_minimal(base_size = 13)
+
+# Cluster summary
+cluster_summary <- merged %>%
+  filter(!is.na(Cluster)) %>%
+  group_by(Cluster) %>%
+  summarise(
+    Avg_HQI = mean(HQI, na.rm = TRUE),
+    Avg_Literacy = mean(Literacy_Rate, na.rm = TRUE),
+    Avg_SC = mean(SC_Percent, na.rm = TRUE),
+    Avg_ST = mean(ST_Percent, na.rm = TRUE),
+    Avg_PopDensity = mean(Population_Density, na.rm = TRUE),
+    Count = n()
+  )
+
+print(cluster_summary)
+
+# Hypothesis testing
+model <- lm(Female_Literacy_Rate ~ SC_Percent + ST_Percent, data = merged)
+summary(model)
+
+# Scatter plots
+ggplot(merged, aes(x = SC_Percent, y = Female_Literacy_Rate)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(title = "SC % vs Female Literacy", x = "SC Percent", y = "Female Literacy Rate")
+
+ggplot(merged, aes(x = ST_Percent, y = Female_Literacy_Rate)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(title = "ST % vs Female Literacy", x = "ST Percent", y = "Female Literacy Rate")
